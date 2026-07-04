@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: raplica-ai-chatbot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: cd backend && gunicorn app:app
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
