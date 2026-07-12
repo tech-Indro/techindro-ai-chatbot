@@ -1,3 +1,13 @@
+---
+title: Raplica AI Chatbot
+emoji: 🤖
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Raplica AI Chatbot
 
 Hey there! This is **Raplica AI** — a custom multi-role chatbot I built that acts as a specialized assistant for different types of users: Students, Teachers, Farmers, Doctors, and Women. 
