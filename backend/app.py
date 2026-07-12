@@ -12,12 +12,22 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 
+# RAG imports
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
+
+
 load_dotenv()
 
 api_key = os.getenv("GEMINI_API_KEY")
 if api_key:
-    api_key = api_key.strip()
-genai.configure(api_key=api_key, transport='rest')
+    api_key = api_key.strip().strip("'\"")
+    if api_key in ["YOUR_GEMINI_API_KEY_HERE", "your_api_key_here", "AIzaSyBqU-Tbo_eIUOEY76pKyMuJU0yTFiTNVoA", ""] or len(api_key) < 15:
+        api_key = None
+    else:
+        genai.configure(api_key=api_key, transport='rest')
+
 
 app = Flask(__name__, static_folder="../frontend", static_url_path="/")
 app.config['SECRET_KEY'] = 'supersecretkey123'
@@ -27,6 +37,10 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 login_manager = LoginManager()
 login_manager.init_app(app)
+
+# Initialize Hugging Face embeddings model
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
 
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -50,7 +64,7 @@ class Message(db.Model):
 
 @login_manager.user_loader
 def load_user(user_id):
-    return User.query.get(int(user_id))
+    return db.session.get(User, int(user_id))
 
 with app.app_context():
     db.create_all()
@@ -132,9 +146,22 @@ def chat():
     if not current_user.is_authenticated:
         return jsonify({"error": "Must be logged in to chat"}), 401
 
+    # 1. Manage/Create Session first so we have chat_session.id
+    if session_id and session_id != 'null':
+        chat_session = db.session.get(ChatSession, int(session_id))
+        if not chat_session or chat_session.user_id != current_user.id:
+            return jsonify({"error": "Invalid session"}), 403
+    else:
+        # Create new session
+        title = text[:30] + "..." if text else "New Chat with File"
+        chat_session = ChatSession(user_id=current_user.id, title=title)
+        db.session.add(chat_session)
+        db.session.commit()
+
     attachment = None
     attachment_type = None
     extracted_text = ""
+    filename = ""
     
     if file:
         filename = secure_filename(file.filename)
@@ -155,44 +182,80 @@ def chat():
             extracted_text = file_bytes.decode("utf-8")
             attachment_type = "text"
 
-    # Prepare user parts
-    user_parts = []
-    if extracted_text:
-        user_parts.append(f"--- Document Content ---\n{extracted_text}\n----------------------\n")
+    # 2. If document text is extracted, chunk it and create/update session-specific FAISS index
+    session_vs_path = os.path.join(app.instance_path, "vector_stores", str(chat_session.id))
+    if attachment_type == "text" and extracted_text.strip():
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        chunks = text_splitter.split_text(extracted_text)
+        if chunks:
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(session_vs_path), exist_ok=True)
+            
+            # Check if index already exists
+            if os.path.exists(session_vs_path) and os.listdir(session_vs_path):
+                db_index = FAISS.load_local(session_vs_path, embeddings, allow_dangerous_deserialization=True)
+                db_index.add_texts(chunks)
+                db_index.save_local(session_vs_path)
+            else:
+                db_index = FAISS.from_texts(chunks, embeddings)
+                db_index.save_local(session_vs_path)
+
+    # 3. Build database parts to save (simple & lightweight)
+    db_user_parts = []
+    if file:
+        if attachment_type == "image":
+            db_user_parts.append("[Image attached]")
+        else:
+            db_user_parts.append(f"[Document attached: {filename}]")
     if text:
-        user_parts.append(text)
-        
-    db_user_parts = list(user_parts)
-    if attachment_type == "image" and attachment:
-        user_parts.append(attachment)
-        db_user_parts.append("[Image attached]")
+        db_user_parts.append(text)
 
-    # Manage Session
-    if session_id and session_id != 'null':
-        chat_session = ChatSession.query.get(int(session_id))
-        if not chat_session or chat_session.user_id != current_user.id:
-            return jsonify({"error": "Invalid session"}), 403
-    else:
-        # Create new session
-        title = text[:30] + "..." if text else "New Chat with File"
-        chat_session = ChatSession(user_id=current_user.id, title=title)
-        db.session.add(chat_session)
-        db.session.commit()
-
-    # Save user message
+    # Save user message to database
     user_msg = Message(session_id=chat_session.id, role="user", content=json.dumps(db_user_parts))
     db.session.add(user_msg)
     db.session.commit()
 
-    # Fetch previous messages for Gemini context
+    # 4. Perform similarity search if vector store exists
+    has_vector_store = os.path.exists(session_vs_path) and os.listdir(session_vs_path)
+    
+    # We retrieve context based on the current user query `text`
+    retrieved_context = ""
+    if has_vector_store and text:
+        try:
+            db_index = FAISS.load_local(session_vs_path, embeddings, allow_dangerous_deserialization=True)
+            docs = db_index.similarity_search(text, k=4)
+            retrieved_context = "\n\n".join(doc.page_content for doc in docs)
+        except Exception as e:
+            app.logger.error(f"Error loading or searching vector store: {e}")
+
+    # Build prompt/parts for Gemini
+    user_parts = []
+    if retrieved_context:
+        prompt_with_context = (
+            "Use the following pieces of context to answer the question at the end.\n"
+            "If you don't know the answer or if the context doesn't contain the answer, "
+            "say that you don't know based on the provided documents.\n\n"
+            f"Context:\n{retrieved_context}\n\n"
+            f"Question: {text}"
+        )
+        user_parts.append(prompt_with_context)
+    else:
+        if text:
+            user_parts.append(text)
+
+    if attachment_type == "image" and attachment:
+        user_parts.append(attachment)
+
+    # 5. Fetch previous messages for Gemini context
     previous_messages = Message.query.filter_by(session_id=chat_session.id).order_by(Message.timestamp.asc()).all()
     gemini_messages = []
     for m in previous_messages:
-        # Skip the one we just added to properly append it with the image object if present
+        # Skip the message we just added to send the context-augmented version instead
         if m.id == user_msg.id:
             continue
         gemini_messages.append({"role": "user" if m.role == "user" else "model", "parts": json.loads(m.content)})
     
+    # Append current augmented query/parts
     gemini_messages.append({"role": "user", "parts": user_parts})
 
     system_prompt = ROLES.get(role, ROLES["Student"])
@@ -200,8 +263,15 @@ def chat():
     model = genai.GenerativeModel('gemini-flash-lite-latest', system_instruction=system_prompt)
     
     try:
-        response = model.generate_content(gemini_messages)
+        # Optimize generation parameters for factual, context-aligned RAG output
+        generation_config = {
+            "temperature": 0.3,
+            "top_p": 0.95,
+            "max_output_tokens": 2048
+        }
+        response = model.generate_content(gemini_messages, generation_config=generation_config)
         reply = response.text
+
         
         # Save model response
         model_msg = Message(session_id=chat_session.id, role="model", content=json.dumps([reply]))
@@ -211,6 +281,7 @@ def chat():
         return jsonify({"reply": reply, "session_id": chat_session.id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))

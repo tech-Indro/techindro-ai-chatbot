@@ -13,6 +13,10 @@ COPY requirements.txt .
 # Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-download Hugging Face sentence-transformers model to bake it into the image
+RUN python -c "from langchain_huggingface import HuggingFaceEmbeddings; HuggingFaceEmbeddings(model_name='sentence-transformers/all-MiniLM-L6-v2')"
+
+
 # Copy all code
 COPY . .
 
@@ -23,4 +27,5 @@ EXPOSE 7860
 ENV PORT=7860
 
 # Run the application
-CMD ["gunicorn", "--bind", "0.0.0.0:7860", "backend.app:app"]
+CMD ["streamlit", "run", "app.py", "--server.port", "7860", "--server.address", "0.0.0.0"]
+
