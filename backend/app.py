@@ -14,7 +14,7 @@ from flask_login import LoginManager, UserMixin, login_user, login_required, log
 
 load_dotenv()
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"), transport='rest')
 
 app = Flask(__name__, static_folder="../frontend", static_url_path="/")
 app.config['SECRET_KEY'] = 'supersecretkey123'
