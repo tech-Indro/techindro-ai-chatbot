@@ -1,13 +1,3 @@
----
-title: Raplica AI Chatbot
-emoji: 🤖
-colorFrom: blue
-colorTo: purple
-sdk: docker
-app_port: 7860
-pinned: false
----
-
 # Raplica AI: Multimodal Edge-Capable RAG & Conversational Platform
 
 Raplica AI is a containerized, low-latency Retrieval-Augmented Generation (RAG) conversational platform designed for **edge-capable, low-overhead environments**. It integrates multimodal image processing, database-backed authentication, session persistence, and local session-isolated vector indexing using FAISS and Hugging Face sentence embeddings.
